@@ -17,6 +17,7 @@ import {
   getDownloadProgress,
   cancelDownload,
   ChunkVerificationError,
+  RangeResponseError,
   type ResumableFetchOptions,
   type ResumableProgress,
 } from './resumable.js';
@@ -52,10 +53,16 @@ async function createRealChunkedInfo(
     totalSize += chunk.length;
   }
 
-  // Compute root hash from concatenated hashes
-  const concatenated = hashes.join('');
-  const rootData = new TextEncoder().encode(concatenated);
-  const root = await computeHash(rootData);
+  // Compute root hash the same way chunked.ts does: a single chunk's root
+  // is its own hash; otherwise hash the concatenation of all chunk hashes.
+  let root: SRIString;
+  if (hashes.length === 1) {
+    root = hashes[0];
+  } else {
+    const concatenated = hashes.join('');
+    const rootData = new TextEncoder().encode(concatenated);
+    root = await computeHash(rootData);
+  }
 
   // Concatenate all chunks into full data
   const fullData = new Uint8Array(totalSize);
@@ -464,6 +471,301 @@ describe('Resumable Downloads', () => {
 
         const storedChunks = await loadChunks(url);
         expect(storedChunks.size).toBe(0);
+      });
+
+      it('should re-hash stored chunks on resume and restart cleanly when a cached chunk is corrupt', async () => {
+        const url = 'https://example.com/resume.bin';
+        const chunks = [
+          new Uint8Array([1, 2, 3]),
+          new Uint8Array([4, 5, 6]),
+          new Uint8Array([7, 8, 9]),
+        ];
+        const { chunked, fullData } = await createRealChunkedInfo(chunks);
+
+        await saveDownloadState({
+          url,
+          chunked,
+          verifiedChunks: 2,
+          bytesVerified: 6,
+          startedAt: Date.now() - 10000,
+          lastUpdated: Date.now() - 5000,
+        });
+        // Chunk 0 is valid, chunk 1 was corrupted after being persisted.
+        await saveChunk(url, 0, chunks[0].buffer);
+        await saveChunk(url, 1, new Uint8Array([4, 99, 6]).buffer);
+
+        const mockFetch = createChunkedFetchMock(fullData);
+
+        const result = await verifyFetchResumable(url, {
+          chunked,
+          fetchImpl: mockFetch,
+          persist: true,
+        });
+
+        // Corrupt cache must not be trusted: full re-download from chunk 0.
+        expect(result.resumed).toBe(false);
+        expect(result.chunksResumed).toBe(0);
+        expect(mockFetch).toHaveBeenCalledTimes(3);
+        expect(new Uint8Array(result.data)).toEqual(fullData);
+
+        // State was cleared on completion; no corrupt chunks linger.
+        expect(await loadDownloadState(url)).toBeNull();
+        expect((await loadChunks(url)).size).toBe(0);
+      });
+
+      it('should restart cleanly when a stored chunk is missing', async () => {
+        const url = 'https://example.com/resume.bin';
+        const chunks = [
+          new Uint8Array([1, 2, 3]),
+          new Uint8Array([4, 5, 6]),
+        ];
+        const { chunked, fullData } = await createRealChunkedInfo(chunks);
+
+        await saveDownloadState({
+          url,
+          chunked,
+          verifiedChunks: 2,
+          bytesVerified: 6,
+          startedAt: Date.now() - 10000,
+          lastUpdated: Date.now() - 5000,
+        });
+        // Only chunk 0 exists in the cache; chunk 1 was lost.
+        await saveChunk(url, 0, chunks[0].buffer);
+
+        const mockFetch = createChunkedFetchMock(fullData);
+
+        const result = await verifyFetchResumable(url, {
+          chunked,
+          fetchImpl: mockFetch,
+          persist: true,
+        });
+
+        expect(result.resumed).toBe(false);
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+        expect(new Uint8Array(result.data)).toEqual(fullData);
+      });
+
+      it('should rebuild bytesVerified from replayed chunks instead of trusting stale state counters', async () => {
+        const url = 'https://example.com/resume.bin';
+        const chunks = [
+          new Uint8Array([1, 2, 3]),
+          new Uint8Array([4, 5, 6]),
+          new Uint8Array([7, 8, 9]),
+        ];
+        const { chunked, fullData } = await createRealChunkedInfo(chunks);
+
+        // Persisted counter lies (claims 999 bytes); actual cached bytes are 6.
+        await saveDownloadState({
+          url,
+          chunked,
+          verifiedChunks: 2,
+          bytesVerified: 999,
+          startedAt: Date.now() - 10000,
+          lastUpdated: Date.now() - 5000,
+        });
+        await saveChunk(url, 0, chunks[0].buffer);
+        await saveChunk(url, 1, chunks[1].buffer);
+
+        const mockFetch = createChunkedFetchMock(fullData);
+        const progressCalls: ResumableProgress[] = [];
+
+        const result = await verifyFetchResumable(url, {
+          chunked,
+          fetchImpl: mockFetch,
+          persist: true,
+          onProgress: (progress) => progressCalls.push({ ...progress }),
+        });
+
+        expect(result.resumed).toBe(true);
+        expect(result.chunksResumed).toBe(2);
+
+        // First new-chunk progress must be anchored on the real 6 bytes, not 999.
+        const firstProgress = progressCalls[0];
+        expect(firstProgress.chunksVerified).toBe(3);
+        expect(firstProgress.bytesVerified).toBe(9);
+        expect(new Uint8Array(result.data)).toEqual(fullData);
+      });
+
+      it('should fail closed and clear state when the server ignores Range and returns 200', async () => {
+        const url = 'https://example.com/resume.bin';
+        const chunks = [
+          new Uint8Array([1, 2, 3]),
+          new Uint8Array([4, 5, 6]),
+        ];
+        const { chunked, fullData } = await createRealChunkedInfo(chunks);
+
+        await saveDownloadState({
+          url,
+          chunked,
+          verifiedChunks: 1,
+          bytesVerified: 3,
+          startedAt: Date.now() - 10000,
+          lastUpdated: Date.now() - 5000,
+        });
+        await saveChunk(url, 0, chunks[0].buffer);
+
+        const mockFetch = vi.fn().mockResolvedValue(
+          new Response(fullData.slice(), {
+            status: 200,
+            headers: { 'Content-Length': String(fullData.length) },
+          })
+        );
+
+        await expect(
+          verifyFetchResumable(url, {
+            chunked,
+            fetchImpl: mockFetch,
+            persist: true,
+          })
+        ).rejects.toThrow(RangeResponseError);
+
+        // Old state and chunks must be cleared so the next call starts clean.
+        expect(await loadDownloadState(url)).toBeNull();
+        expect((await loadChunks(url)).size).toBe(0);
+      });
+
+      it('should fail closed when Content-Range start does not match the requested range', async () => {
+        const url = 'https://example.com/resume.bin';
+        const chunks = [
+          new Uint8Array([1, 2, 3]),
+          new Uint8Array([4, 5, 6]),
+        ];
+        const { chunked, fullData } = await createRealChunkedInfo(chunks);
+
+        await saveDownloadState({
+          url,
+          chunked,
+          verifiedChunks: 1,
+          bytesVerified: 3,
+          startedAt: Date.now() - 10000,
+          lastUpdated: Date.now() - 5000,
+        });
+        await saveChunk(url, 0, chunks[0].buffer);
+
+        // Server restarts the response at byte 0 instead of byte 3.
+        const mockFetch = vi.fn().mockImplementation(async () => {
+          const body = fullData.slice(0, 3);
+          return new Response(body.buffer, {
+            status: 206,
+            headers: {
+              'Content-Range': `bytes 0-2/${fullData.length}`,
+              'Content-Length': '3',
+            },
+          });
+        });
+
+        await expect(
+          verifyFetchResumable(url, {
+            chunked,
+            fetchImpl: mockFetch,
+            persist: true,
+          })
+        ).rejects.toThrow(RangeResponseError);
+
+        expect(await loadDownloadState(url)).toBeNull();
+        expect((await loadChunks(url)).size).toBe(0);
+      });
+
+      it('should fail closed when Content-Range total size changes between chunks', async () => {
+        const url = 'https://example.com/resume.bin';
+        const chunks = [
+          new Uint8Array([1, 2, 3]),
+          new Uint8Array([4, 5, 6]),
+        ];
+        const { chunked, fullData } = await createRealChunkedInfo(chunks);
+
+        await saveDownloadState({
+          url,
+          chunked,
+          verifiedChunks: 1,
+          bytesVerified: 3,
+          totalSize: 6,
+          startedAt: Date.now() - 10000,
+          lastUpdated: Date.now() - 5000,
+        });
+        await saveChunk(url, 0, chunks[0].buffer);
+
+        // Reused/old file version: same requested interval, different total.
+        const mockFetch = vi.fn().mockImplementation(async () => {
+          const body = fullData.slice(3, 6);
+          return new Response(body.buffer, {
+            status: 206,
+            headers: {
+              'Content-Range': 'bytes 3-5/999',
+              'Content-Length': '3',
+            },
+          });
+        });
+
+        await expect(
+          verifyFetchResumable(url, {
+            chunked,
+            fetchImpl: mockFetch,
+            persist: true,
+          })
+        ).rejects.toThrow(RangeResponseError);
+
+        expect(await loadDownloadState(url)).toBeNull();
+        expect((await loadChunks(url)).size).toBe(0);
+      });
+
+      it('should fail closed when the response body does not cover the Content-Range interval', async () => {
+        const url = 'https://example.com/resume.bin';
+        const chunks = [
+          new Uint8Array([1, 2, 3]),
+          new Uint8Array([4, 5, 6]),
+        ];
+        const { chunked, fullData } = await createRealChunkedInfo(chunks);
+
+        await saveDownloadState({
+          url,
+          chunked,
+          verifiedChunks: 1,
+          bytesVerified: 3,
+          startedAt: Date.now() - 10000,
+          lastUpdated: Date.now() - 5000,
+        });
+        await saveChunk(url, 0, chunks[0].buffer);
+
+        // Header promises bytes 3-5 but the body is truncated to two bytes.
+        const mockFetch = vi.fn().mockImplementation(async () => {
+          const body = fullData.slice(3, 5);
+          return new Response(body.buffer, {
+            status: 206,
+            headers: {
+              'Content-Range': `bytes 3-5/${fullData.length}`,
+              'Content-Length': '2',
+            },
+          });
+        });
+
+        await expect(
+          verifyFetchResumable(url, {
+            chunked,
+            fetchImpl: mockFetch,
+            persist: true,
+          })
+        ).rejects.toThrow(RangeResponseError);
+
+        expect(await loadDownloadState(url)).toBeNull();
+      });
+
+      it('should reject a chunked config whose root does not derive from its chunk hashes', async () => {
+        const chunks = [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6])];
+        const { chunked } = await createRealChunkedInfo(chunks);
+
+        const tampered: ChunkedInfo = {
+          ...chunked,
+          root: 'sha256-tamperedRoot=' as SRIString,
+        };
+
+        await expect(
+          verifyFetchResumable('https://example.com/test.bin', {
+            chunked: tampered,
+            fetchImpl: vi.fn(),
+            persist: false,
+          })
+        ).rejects.toThrow(/root hash mismatch/);
       });
     });
 

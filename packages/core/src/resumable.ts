@@ -6,7 +6,7 @@
  */
 
 import type { ChunkedInfo, SRIString } from './types.js';
-import { createChunkedVerifier } from './chunked.js';
+import { computeRootHash } from './chunked.js';
 import {
   saveDownloadState,
   loadDownloadState,
@@ -144,6 +144,20 @@ export async function verifyFetchResumable(
     throw new Error('Chunked config has no hashes');
   }
 
+  const algorithm = algorithmFromSri(chunked.root);
+  const chunkHashes = chunked.hashes || [];
+
+  // Fail fast on an internally inconsistent manifest: every chunk hash is
+  // anchored by the aggregate root, so a wrong root means the config itself
+  // cannot be trusted.
+  const declaredRoot = await computeRootHash(chunkHashes, algorithm);
+  if (declaredRoot !== chunked.root) {
+    throw new Error(
+      `Chunked root hash mismatch for ${urlString}: ` +
+      `manifest declares ${chunked.root}, but chunk hashes derive ${declaredRoot}`
+    );
+  }
+
   // Check for existing download state
   let existingState: DownloadState | null = null;
   let existingChunks = new Map<number, ArrayBuffer>();
@@ -160,13 +174,36 @@ export async function verifyFetchResumable(
 
       if (existingHashes.length === currentHashes.length &&
           existingState.chunked.root === chunked.root) {
-        // Config matches, we can resume
-        existingChunks = await loadChunks(urlString);
-        chunksResumed = existingState.verifiedChunks;
-        resumed = true;
+        // Config matches, but cached bytes are never trusted on their own.
+        // Replay the hash of every stored chunk before resuming so a corrupt
+        // cache or a recycled old file cannot be stitched into the result.
+        const storedChunks = await loadChunks(urlString);
+        const replay = await replayStoredChunks(
+          storedChunks,
+          existingState.verifiedChunks,
+          currentHashes
+        );
 
-        if (onResume) {
-          onResume(existingState);
+        if (!replay) {
+          // Stored state/cache failed re-verification - fail closed and
+          // restart from scratch instead of building a corrupt file.
+          await deleteDownloadState(urlString);
+          existingState = null;
+        } else {
+          existingChunks = replay.chunks;
+          chunksResumed = existingState.verifiedChunks;
+          resumed = true;
+
+          // Rebuild counters from replayed evidence rather than trusting the
+          // persisted start/end/total bookkeeping.
+          existingState = {
+            ...existingState,
+            bytesVerified: replay.bytesVerified,
+          };
+
+          if (onResume) {
+            onResume(existingState);
+          }
         }
       } else {
         // Config changed, start fresh
@@ -235,7 +272,6 @@ export async function verifyFetchResumable(
 
   // Download and verify remaining chunks
   const startChunk = state.verifiedChunks;
-  const chunkHashes = chunked.hashes || [];
 
   for (let i = startChunk; i < totalChunks; i++) {
     const rangeStart = i * chunked.chunkSize;
@@ -253,22 +289,72 @@ export async function verifyFetchResumable(
       fetchImpl
     );
 
-    // Get total size from first response
-    if (i === startChunk && !state.totalSize) {
-      const contentRange = response.headers.get('Content-Range');
-      if (contentRange) {
-        const match = contentRange.match(/\/(\d+)$/);
-        if (match) {
-          state.totalSize = parseInt(match[1], 10);
-        }
-      }
+    // A server that ignores Range and replies 200 OK would make us splice the
+    // whole file into a single chunk slot. Fail closed and clear stale state.
+    if (response.status === 200) {
+      await failClosed(
+        urlString,
+        persist,
+        `server ignored the Range request and returned 200 OK for chunk ${i}; ` +
+        `206 Partial Content is required for resumable downloads`
+      );
     }
 
-    if (!response.ok && response.status !== 206) {
-      throw new Error(`Failed to fetch chunk ${i}: ${response.status} ${response.statusText}`);
+    if (response.status !== 206) {
+      // Transport-level errors (404, 500, ...) remain retryable: verified
+      // chunks are preserved so a later call can resume.
+      if (!response.ok) {
+        throw new Error(`Failed to fetch chunk ${i}: ${response.status} ${response.statusText}`);
+      }
+
+      await failClosed(
+        urlString,
+        persist,
+        `unexpected status ${response.status} ${response.statusText} for chunk ${i}; ` +
+        `expected 206 Partial Content`
+      );
+    }
+
+    // Strictly validate the 206 Content-Range against the requested interval.
+    const contentRange = response.headers.get('Content-Range');
+    let parsedRange: ParsedContentRange;
+    try {
+      parsedRange = parseContentRange(
+        contentRange,
+        rangeStart,
+        rangeEnd,
+        state.totalSize
+      );
+    } catch (error) {
+      await failClosed(urlString, persist, (error as Error).message);
+      throw error;
     }
 
     const chunkData = await response.arrayBuffer();
+
+    // The response body must cover exactly the advertised byte interval.
+    const expectedLength = parsedRange.end - parsedRange.start + 1;
+    if (chunkData.byteLength !== expectedLength) {
+      await failClosed(
+        urlString,
+        persist,
+        `response body for chunk ${i} is ${chunkData.byteLength} bytes but ` +
+        `Content-Range covers ${expectedLength} bytes (${contentRange})`
+      );
+    }
+
+    if (parsedRange.totalSize !== undefined) {
+      if (state.totalSize === undefined) {
+        state.totalSize = parsedRange.totalSize;
+      } else if (state.totalSize !== parsedRange.totalSize) {
+        await failClosed(
+          urlString,
+          persist,
+          `Content-Range total size changed mid-download for chunk ${i}: ` +
+          `expected ${state.totalSize}, got ${parsedRange.totalSize}`
+        );
+      }
+    }
 
     // Verify chunk
     const expectedHash = chunkHashes[i];
@@ -308,6 +394,29 @@ export async function verifyFetchResumable(
   for (const chunk of allChunks) {
     result.set(new Uint8Array(chunk), offset);
     offset += chunk.byteLength;
+  }
+
+  // Final integrity gate: the assembled chunk list must derive the manifest
+  // root, and byte counters must agree with the server-declared total.
+  const finalRoot = await computeRootHash(chunkHashes, algorithm);
+  if (finalRoot !== chunked.root) {
+    if (persist && isStorageAvailable()) {
+      await deleteDownloadState(urlString);
+    }
+    throw new Error(
+      `Chunked root hash mismatch for ${urlString}: ` +
+      `expected ${chunked.root}, computed ${finalRoot}`
+    );
+  }
+
+  if (state.totalSize !== undefined && totalBytes !== state.totalSize) {
+    if (persist && isStorageAvailable()) {
+      await deleteDownloadState(urlString);
+    }
+    throw new Error(
+      `Total size mismatch for ${urlString}: ` +
+      `server declared ${state.totalSize} bytes but assembled ${totalBytes} bytes`
+    );
   }
 
   // Clean up storage
@@ -351,6 +460,20 @@ export class ChunkVerificationError extends Error {
       `The download can be retried - verified chunks are preserved.`
     );
     this.name = 'ChunkVerificationError';
+  }
+}
+
+/**
+ * Error thrown when a server response is incompatible with resumable
+ * range semantics (ignored Range, wrong Content-Range, or changing size).
+ *
+ * The persisted download state has already been cleared when this is thrown,
+ * so the next attempt starts cleanly instead of stitching corrupt bytes.
+ */
+export class RangeResponseError extends Error {
+  constructor(public readonly url: string, reason: string) {
+    super(`Invalid range response for ${url}: ${reason}`);
+    this.name = 'RangeResponseError';
   }
 }
 
@@ -401,6 +524,147 @@ export async function cancelDownload(url: string): Promise<void> {
 }
 
 // ============ Internal helpers ============
+
+/**
+ * Parsed fields of a `Content-Range: bytes start-end/total` header
+ */
+interface ParsedContentRange {
+  start: number;
+  end: number;
+  totalSize?: number;
+}
+
+/**
+ * Abort the download and wipe persisted state when the server violates
+ * range semantics. Returns never so callers can rely on control-flow
+ * narrowing after invoking it.
+ */
+async function failClosed(
+  url: string,
+  persist: boolean,
+  reason: string
+): Promise<never> {
+  if (persist && isStorageAvailable()) {
+    await deleteDownloadState(url);
+  }
+  throw new RangeResponseError(url, reason);
+}
+
+/**
+ * Parse and strictly validate a 206 Content-Range header against the
+ * requested interval and any previously observed total size.
+ */
+function parseContentRange(
+  headerValue: string | null,
+  requestedStart: number,
+  requestedEnd: number,
+  knownTotalSize: number | undefined
+): ParsedContentRange {
+  if (!headerValue) {
+    throw new Error(
+      `206 response is missing a Content-Range header ` +
+      `(requested bytes ${requestedStart}-${requestedEnd})`
+    );
+  }
+
+  const match = headerValue.match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/);
+  if (!match) {
+    throw new Error(`malformed Content-Range header: ${headerValue}`);
+  }
+
+  const start = parseInt(match[1], 10);
+  const end = parseInt(match[2], 10);
+  const totalSize = match[3] === '*' ? undefined : parseInt(match[3], 10);
+
+  if (start !== requestedStart) {
+    throw new Error(
+      `Content-Range start ${start} does not match requested start ${requestedStart} ` +
+      `(${headerValue})`
+    );
+  }
+
+  if (end < start) {
+    throw new Error(`Content-Range end precedes start (${headerValue})`);
+  }
+
+  if (end > requestedEnd) {
+    throw new Error(
+      `Content-Range end ${end} exceeds requested end ${requestedEnd} ` +
+      `(${headerValue})`
+    );
+  }
+
+  if (totalSize !== undefined) {
+    if (end >= totalSize) {
+      throw new Error(
+        `Content-Range end ${end} must be smaller than total size ${totalSize} ` +
+        `(${headerValue})`
+      );
+    }
+
+    if (knownTotalSize !== undefined && totalSize !== knownTotalSize) {
+      throw new Error(
+        `Content-Range total size ${totalSize} does not match previously observed ` +
+        `total ${knownTotalSize} (${headerValue})`
+      );
+    }
+  }
+
+  return { start, end, totalSize };
+}
+
+/**
+ * Result of replaying stored chunks through hash verification
+ */
+interface ReplayResult {
+  chunks: Map<number, ArrayBuffer>;
+  bytesVerified: number;
+}
+
+/**
+ * Re-hash every persisted chunk claimed by the saved state before trusting
+ * it for resume. Returns null when any chunk is missing or mismatches its
+ * manifest hash, which forces a clean restart.
+ */
+async function replayStoredChunks(
+  storedChunks: Map<number, ArrayBuffer>,
+  verifiedChunks: number,
+  expectedHashes: SRIString[]
+): Promise<ReplayResult | null> {
+  if (verifiedChunks < 0 || verifiedChunks > expectedHashes.length) {
+    return null;
+  }
+
+  const replayed = new Map<number, ArrayBuffer>();
+  let bytesVerified = 0;
+
+  for (let index = 0; index < verifiedChunks; index++) {
+    const data = storedChunks.get(index);
+    if (!data) {
+      return null;
+    }
+
+    const actualHash = await hashChunk(new Uint8Array(data));
+    if (actualHash !== expectedHashes[index]) {
+      return null;
+    }
+
+    replayed.set(index, data);
+    bytesVerified += data.byteLength;
+  }
+
+  return { chunks: replayed, bytesVerified };
+}
+
+/**
+ * Resolve the hash algorithm from an SRI string
+ */
+function algorithmFromSri(sri: SRIString): 'sha256' | 'sha384' | 'sha512' {
+  if (sri.startsWith('sha256-')) return 'sha256';
+  if (sri.startsWith('sha384-')) return 'sha384';
+  if (sri.startsWith('sha512-')) return 'sha512';
+  throw new Error(`Unknown algorithm in SRI: ${sri}`);
+}
 
 /**
  * Fetch with timeout

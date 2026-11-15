@@ -268,7 +268,7 @@ async function hashChunk(
  * The root serves as a quick check that the chunk list wasn't modified,
  * but doesn't provide proof-of-inclusion for individual chunks.
  */
-async function computeRootHash(
+export async function computeRootHash(
   chunkHashes: SRIString[],
   algorithm: HashAlgorithm
 ): Promise<SRIString> {
@@ -299,4 +299,3 @@ function parseAlgorithmFromSri(sri: SRIString): HashAlgorithm {
   if (sri.startsWith('sha512-')) return 'sha512';
   throw new Error(`Unknown algorithm in SRI: ${sri}`);
 }
-

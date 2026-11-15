@@ -92,6 +92,7 @@ export {
   getDownloadProgress,
   cancelDownload,
   ChunkVerificationError,
+  RangeResponseError,
 } from './resumable.js';
 export type {
   ResumableFetchOptions,
